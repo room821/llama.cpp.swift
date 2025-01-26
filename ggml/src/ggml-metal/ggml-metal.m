@@ -19,6 +19,8 @@
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
 
+#define GGML_METAL_MAX_RESIDENCY_SETS 128
+
 #define UNUSED(x) (void)(x)
 
 // globals
@@ -37,6 +39,9 @@ static struct ggml_backend_metal_device_context {
     id<MTLDevice> mtl_device;
     int           mtl_device_ref_count;
 
+    id<MTLResidencySet> mtl_residency_set[GGML_METAL_MAX_RESIDENCY_SETS];
+    int                 mtl_residency_set_n;
+
     bool has_simdgroup_reduction;
     bool has_simdgroup_mm;
     bool has_bfloat;
@@ -46,6 +51,8 @@ static struct ggml_backend_metal_device_context {
 } g_ggml_ctx_dev_main = {
     /*.mtl_device              =*/ nil,
     /*.mtl_device_ref_count    =*/ 0,
+    /*.mtl_residency_set       =*/ { nil },
+    /*.mtl_residency_set_n     =*/ 0,
     /*.has_simdgroup_reduction =*/ false,
     /*.has_simdgroup_mm        =*/ false,
     /*.has_bfloat              =*/ false,
@@ -93,6 +100,41 @@ static void ggml_backend_metal_device_rel(struct ggml_backend_metal_device_conte
         [ctx->mtl_device release];
         ctx->mtl_device = nil;
     }
+}
+
+// add residency set
+static bool ggml_backend_metal_device_add_residency_set(struct ggml_backend_metal_device_context * ctx, id<MTLResidencySet> residency_set) {
+    assert(ctx != NULL);
+    assert(queue != nil);
+
+    if (ctx->mtl_residency_set_n >= GGML_METAL_MAX_RESIDENCY_SETS) {
+        GGML_LOG_ERROR("%s: warning: maximum number of residency sets reached\n", __func__);
+        return false;
+    }
+
+    ctx->mtl_residency_set[ctx->mtl_residency_set_n++] = residency_set;
+
+    return true;
+}
+
+// remove residency set
+static bool ggml_backend_metal_device_remove_residency_set(struct ggml_backend_metal_device_context * ctx, id<MTLResidencySet> residency_set) {
+    assert(ctx != NULL);
+    assert(residency_set != nil);
+
+    for (int i = 0; i < ctx->mtl_residency_set_n; ++i) {
+        if (ctx->mtl_residency_set[i] == residency_set) {
+            for (int j = i; j < ctx->mtl_residency_set_n - 1; ++j) {
+                ctx->mtl_residency_set[j] = ctx->mtl_residency_set[j + 1];
+            }
+
+            ctx->mtl_residency_set_n--;
+
+            return true;
+        }
+    }
+
+    return false;
 }
 
 // kernels
@@ -483,6 +525,11 @@ static struct ggml_backend_metal_context * ggml_metal_init(ggml_backend_dev_t de
     GGML_LOG_INFO("%s: picking default device: %s\n", __func__, [[device name] UTF8String]);
 
     ctx->queue  = [device newCommandQueue];
+    if (ctx->queue == nil) {
+        GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
+        return NULL;
+    }
+
     ctx->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
     id<MTLLibrary> metal_library;
@@ -1035,6 +1082,8 @@ struct ggml_backend_metal_buffer_context {
     // multiple buffers are used only to avoid the maximum buffer size limitation when using mmap
     int n_buffers;
     struct ggml_backend_metal_buffer buffers[GGML_METAL_MAX_BUFFERS];
+
+    id<MTLResidencySet> residency_set;
 };
 
 // finds the Metal buffer that contains the tensor data on the GPU device
@@ -4039,6 +4088,23 @@ static enum ggml_status ggml_metal_graph_compute(
     struct ggml_backend_metal_context        * ctx     = backend->context;
     struct ggml_backend_metal_device_context * ctx_dev = backend->device->context;
 
+    // attached residency sets to the queue on the first run
+    // also tested to attached them on each run, but it does not make a difference
+    static bool is_first = true;
+    if (is_first) {
+        is_first = false;
+        GGML_LOG_INFO("%s: adding %d residency sets\n", __func__, ctx_dev->mtl_residency_set_n);
+        [ctx->queue addResidencySets:ctx_dev->mtl_residency_set count:ctx_dev->mtl_residency_set_n];
+    }
+
+    // this does not make a difference
+    //for (int i = 0; i < ctx_dev->mtl_residency_set_n; ++i) {
+    //    GGML_LOG_INFO("%s: residency set %d allocations size = %zu\n", __func__, i, [ctx_dev->mtl_residency_set[i] allocatedSize]);
+    //    [ctx_dev->mtl_residency_set[i] requestResidency];
+    //}
+
+    int64_t t_start_us = ggml_time_us();
+
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = 128;
 
@@ -4086,8 +4152,11 @@ static enum ggml_status ggml_metal_graph_compute(
         // the main thread commits the first few commands immediately
         // command_buffer[n_cb]
         {
-            id<MTLCommandBuffer> command_buffer = [ctx->queue commandBufferWithUnretainedReferences];
+            id<MTLCommandBuffer> command_buffer = [ctx->queue commandBuffer];
             ctx->command_buffers[n_cb] = command_buffer;
+
+            // does not make a difference
+            [command_buffer useResidencySets:ctx_dev->mtl_residency_set count:ctx_dev->mtl_residency_set_n];
 
             [command_buffer enqueue];
             ctx->encode_async(n_cb);
@@ -4096,8 +4165,11 @@ static enum ggml_status ggml_metal_graph_compute(
         // prepare the rest of the command buffers asynchronously
         // command_buffer[0.. n_cb)
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
-            id<MTLCommandBuffer> command_buffer = [ctx->queue commandBufferWithUnretainedReferences];
+            id<MTLCommandBuffer> command_buffer = [ctx->queue commandBuffer];
             ctx->command_buffers[cb_idx] = command_buffer;
+
+            // does not make a difference
+            [command_buffer useResidencySets:ctx_dev->mtl_residency_set count:ctx_dev->mtl_residency_set_n];
 
             // always enqueue the first two command buffers
             // enqueue all of the command buffers if we don't need to abort
@@ -4163,6 +4235,10 @@ static enum ggml_status ggml_metal_graph_compute(
         }
     }
 
+    int64_t t_end_us = ggml_time_us();
+
+    GGML_LOG_DEBUG("%s: compute graph took %8.2f ms\n", __func__, (t_end_us - t_start_us) / 1000.0);
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -4176,6 +4252,13 @@ static void ggml_backend_metal_buffer_free_buffer(ggml_backend_buffer_t buffer) 
     for (int i = 0; i < ctx->n_buffers; i++) {
         [ctx->buffers[i].metal release];
     }
+
+    ggml_backend_metal_device_remove_residency_set(buffer->buft->device->context, ctx->residency_set);
+
+    [ctx->residency_set endResidency];
+    [ctx->residency_set removeAllAllocations];
+    [ctx->residency_set release];
+
     ggml_backend_metal_device_rel(buffer->buft->device->context);
 
     if (ctx->owned) {
@@ -4284,7 +4367,8 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
         size_aligned += (size_page - (size_aligned % size_page));
     }
 
-    id<MTLDevice> device = ggml_backend_metal_device_acq(buft->device->context);
+    struct ggml_backend_metal_device_context * ctx_dev = (struct ggml_backend_metal_device_context *)buft->device->context;
+    id<MTLDevice> device = ggml_backend_metal_device_acq(ctx_dev);
 
     ctx->all_data = ggml_metal_host_malloc(size_aligned);
     ctx->all_size = size_aligned;
@@ -4307,8 +4391,32 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
     if (size_aligned > 0 && (ctx->all_data == NULL || ctx->buffers[0].metal == nil)) {
         GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
         free(ctx);
-        ggml_backend_metal_device_rel(buft->device->context);
+        ggml_backend_metal_device_rel(ctx_dev);
         return NULL;
+    }
+
+    {
+        MTLResidencySetDescriptor * desc;
+        desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"Primary residency set";
+        desc.initialCapacity = ctx->n_buffers;
+
+        NSError *error;
+        ctx->residency_set = [device newResidencySetWithDescriptor:desc error:&error];
+        if (error) {
+            GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+            return NULL;
+        }
+
+        for (int i = 0; i < ctx->n_buffers; i++) {
+            [ctx->residency_set addAllocation:ctx->buffers[i].metal];
+        }
+
+        [ctx->residency_set commit];
+        [ctx->residency_set requestResidency];
+
+        // track the residency set in the device context
+        ggml_backend_metal_device_add_residency_set(ctx_dev, ctx->residency_set);
     }
 
     //ggml_backend_metal_log_allocated_size(device, size_aligned);
@@ -4400,7 +4508,8 @@ ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr(void * data, size_t siz
         size_aligned += (size_page - (size_aligned % size_page));
     }
 
-    id<MTLDevice> device = ggml_backend_metal_device_acq(&g_ggml_ctx_dev_main);
+    struct ggml_backend_metal_device_context * ctx_dev = &g_ggml_ctx_dev_main;
+    id<MTLDevice> device = ggml_backend_metal_device_acq(ctx_dev);
 
     // the buffer fits into the max buffer size allowed by the device
     if (size_aligned <= device.maxBufferLength) {
@@ -4451,6 +4560,30 @@ ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr(void * data, size_t siz
 
             ++ctx->n_buffers;
         }
+    }
+
+    {
+        MTLResidencySetDescriptor * desc;
+        desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"Primary residency set";
+        desc.initialCapacity = ctx->n_buffers;
+
+        NSError *error;
+        ctx->residency_set = [device newResidencySetWithDescriptor:desc error:&error];
+        if (error) {
+            GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+            return NULL;
+        }
+
+        for (int i = 0; i < ctx->n_buffers; i++) {
+            [ctx->residency_set addAllocation:ctx->buffers[i].metal];
+        }
+
+        [ctx->residency_set commit];
+        [ctx->residency_set requestResidency];
+
+        // track the residency set in the device context
+        ggml_backend_metal_device_add_residency_set(ctx_dev, ctx->residency_set);
     }
 
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_from_ptr_type(), ggml_backend_metal_buffer_i, ctx, size);
@@ -4764,6 +4897,30 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_from_ptr(ggml_back
 
             ++ctx->n_buffers;
         }
+    }
+
+    {
+        MTLResidencySetDescriptor * desc;
+        desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"Primary residency set";
+        desc.initialCapacity = ctx->n_buffers;
+
+        NSError *error;
+        ctx->residency_set = [device newResidencySetWithDescriptor:desc error:&error];
+        if (error) {
+            GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+            return NULL;
+        }
+
+        for (int i = 0; i < ctx->n_buffers; i++) {
+            [ctx->residency_set addAllocation:ctx->buffers[i].metal];
+        }
+
+        [ctx->residency_set commit];
+        [ctx->residency_set requestResidency];
+
+        // track the residency set in the device context
+        ggml_backend_metal_device_add_residency_set(ctx_dev, ctx->residency_set);
     }
 
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_from_ptr_type(), ggml_backend_metal_buffer_i, ctx, size);
