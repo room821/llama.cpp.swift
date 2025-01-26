@@ -3,14 +3,14 @@
 import PackageDescription
 
 var sources = [
-    "ggml.c",
-    "sgemm.cpp",
-    "llama.cpp",
-    "unicode.cpp",
-    "unicode-data.cpp",
-    "ggml-alloc.c",
-    "ggml-backend.c",
-    "ggml-quants.c",
+    "ggml/ggml.c",
+    "ggml/src/ggml-cpu/llamafile/sgemm.cpp",
+    "src/llama.cpp",
+    "src/unicode.cpp",
+    "src/unicode-data.cpp",
+    "ggml/ggml-alloc.c",
+    "ggml/ggml-backend.c",
+    "ggml/ggml-quants.c",
 ]
 
 #if canImport(Darwin)
@@ -47,8 +47,6 @@ let package = Package(
                "models",
                "tests",
                "CMakeLists.txt",
-               "ggml-cuda.cu",
-               "ggml-cuda.h",
                "Makefile"
             ],
             sources: sources,
