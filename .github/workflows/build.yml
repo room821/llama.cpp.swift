@@ -491,7 +491,7 @@ jobs:
             -DGGML_SYCL_F16=ON
           cmake --build . --config Release -j $(nproc)
 
-  macOS-latest-cmake-:
+  macOS-latest-cmake-ios:
     runs-on: macos-latest
 
     steps:
