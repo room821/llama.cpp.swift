@@ -491,7 +491,7 @@ jobs:
             -DGGML_SYCL_F16=ON
           cmake --build . --config Release -j $(nproc)
 
-  macOS-latest-cmake-ios:
+  macOS-latest-cmake-:
     runs-on: macos-latest
 
     steps:
@@ -511,17 +511,22 @@ jobs:
           sysctl -a
           mkdir build
           cd build
+          
+          echo "=== cmake for iOS"
           cmake -G Xcode .. \
+            -DCMAKE_INSTALL_RPATH="@rpath" \
             -DGGML_METAL_USE_BF16=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_SERVER=OFF \
             -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
             -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM=ggml
           cmake --build . --config Release -j $(sysctl -n hw.logicalcpu) -- CODE_SIGNING_ALLOWED=NO
-
+          cmake --install . --prefix ../../llama_product_ios
+          cd ..
+          xcodebuild -scheme llama-Package -destination 'generic/platform=iOS'
   macOS-latest-cmake-tvos:
     runs-on: macos-latest
 
